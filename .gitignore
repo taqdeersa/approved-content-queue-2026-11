@@ -1,0 +1,12 @@
+*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/worker.py
+!/sealed_runner.py
+!/requirements.txt
+!/bundle.sealed
+!/state.sealed
+!/.github/
+!/.github/workflows/
+!/.github/workflows/queue.yml

@@ -1,0 +1,5 @@
+*.sealed -diff -merge -text
+*.py text eol=lf
+*.yml text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
