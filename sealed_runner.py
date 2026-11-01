@@ -76,14 +76,17 @@ def seal(source, target):
 
 
 def execution_window(now, mode):
-    day = now.astimezone(worker.RIYADH).date()
+    local = now.astimezone(worker.RIYADH)
+    day = local.date()
+    if mode == "delivery":
+        return day == dt.date(2026, 11, 2) and local.hour >= 9
     if mode == "publish":
         return dt.date(2026, 11, 2) <= day <= dt.date(2026, 11, 29)
     return mode == "verify" and dt.date(2026, 11, 1) <= day <= dt.date(2026, 12, 1)
 
 
-def verify_existing(root, config, api):
-    """Two GETs only. No ledger/save/POST path is reachable from this function."""
+def verification_context(root, config):
+    """Validate immutable local inputs before any API request."""
     manifest, state = worker.read(root / "manifest.json"), worker.read(root / "state.json")
     c = config.get("response_contract", {})
     worker.require(config.get("public_repository_sealed_verified") is True
@@ -112,6 +115,12 @@ def verify_existing(root, config, api):
     worker.require(isinstance(entry.get("provider_mime_type"), str)
                    and type(entry.get("provider_size_bytes")) is int and entry["provider_size_bytes"] > 0,
                    "verify_media_pin_missing")
+    return state, item, entry
+
+
+def read_existing(root, config, api, statuses=("scheduled", "published"), context=None):
+    """Two GETs only, returning private data to the encrypted caller."""
+    state, item, entry = context or verification_context(root, config)
     channels = api.call("GET", "/api/channels")
     selected = [c for c in channels["channels"] if c.get("id") == config.get("channel_id")]
     worker.require(len(selected) == 1, "verify_channel_missing")
@@ -121,19 +130,71 @@ def verify_existing(root, config, api):
                    and channel.get("isActive") is True and channel.get("needsReconnect") is False
                    and channel.get("tokenStatus") == "valid", "verify_identity_mismatch")
     response = api.call("GET", "/api/posts/" + str(entry["provider_post_id"]))
-    post = worker.pointer(response, c["read_post"])
+    post = worker.pointer(response, config["response_contract"]["read_post"])
     worker.require(worker.exact_scheduled_post(post, item, channel["id"], entry["media_id"],
-                   entry["provider_post_id"], statuses=("scheduled", "published")), "verify_post_mismatch")
+                   entry["provider_post_id"], statuses=statuses), "verify_post_mismatch")
     media = post["mediaFiles"][0]
     worker.require(media.get("mimeType") == entry.get("provider_mime_type")
                    and media.get("sizeBytes") == entry.get("provider_size_bytes"), "verify_media_metadata_changed")
+    return post
+
+
+def verify_existing(root, config, api):
+    read_existing(root, config, api)
     return {"status": "verified_existing_post_read_only", "requests": api.count}
+
+
+def delivery_check(root, config, api, now, checkpoint):
+    """One reserved read-only provider check; only encrypted checkpoint writes."""
+    worker.require(execution_window(now, "delivery"), "delivery_window_closed")
+    context = verification_context(root, config)
+    state, item, entry = context
+    worker.require(not entry.get("delivery_evidence"), "delivery_already_attempted_no_retry")
+    evidence = {"status": "read_pending", "attempt_id": os.urandom(16).hex(),
+                "checked_at": now.isoformat(), "provider": "BulkPublish",
+                "source": "provider_api_two_gets", "snapchat_visual_appearance_verified": False,
+                "provider_reported_published": False}
+    entry["delivery_evidence"] = evidence
+    entry["phase"] = "delivery_check_in_progress"
+    checkpoint(root, state)  # A crash must not permit another check or blind feed.
+    try:
+        post = read_existing(root, config, api,
+            statuses=("scheduled", "published", "processing", "publishing", "failed", "partial"), context=context)
+        snap = post["postPlatforms"][0]
+        evidence.update(post_status=post["status"], snapchat_status=snap.get("status"),
+                        provider_post_id=post["id"], requests=api.count)
+        timestamp, timestamp_source = None, None
+        for source, value in [("snapchat_platform", snap.get("publishedAt")), ("global_post", post.get("publishedAt"))]:
+            try:
+                parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.utcoffset() is not None and dt.datetime.fromisoformat(item["scheduled_at"]) <= parsed <= now:
+                    timestamp, timestamp_source = value, source
+                    break
+            except (AttributeError, ValueError, TypeError):
+                pass
+        platform_id = snap.get("platformPostId")
+        reported = (post["status"] == "published" and snap.get("status") == "published"
+                    and isinstance(platform_id, str) and bool(platform_id.strip()) and timestamp is not None)
+        failed = post["status"] in ("failed", "partial") or snap.get("status") == "failed"
+        status = ("provider_reported_delivery_failed_requires_review" if failed else
+                  "provider_reported_published" if reported else "provider_not_yet_reported_published")
+        evidence.update(status=status, provider_reported_published=reported,
+                        platform_post_id=platform_id if isinstance(platform_id, str) else None,
+                        published_at=timestamp, timestamp_source=timestamp_source)
+        entry["phase"] = "delivery_failed_requires_review" if failed else "queued_verified"
+        checkpoint(root, state)
+        return {"status": status, "requests": api.count}
+    except Exception:
+        evidence.update(status="delivery_read_unknown_requires_review", requests=api.count)
+        entry["phase"] = "delivery_read_unknown_requires_review"
+        checkpoint(root, state)
+        raise worker.Halt("delivery_result_unknown_no_retry")
 
 
 def run(repo, execute=False, mode="verify", now=None):
     now = now or dt.datetime.now(worker.RIYADH)
-    worker.require(mode in ("verify", "publish") and not (mode == "verify" and execute), "verify_cannot_execute")
-    needs_api = mode == "verify" or execute
+    worker.require(mode in ("verify", "publish", "delivery") and not (mode != "publish" and execute), "read_only_mode_cannot_execute")
+    needs_api = mode in ("verify", "delivery") or execute
     worker.require(not needs_api or execution_window(now, mode), "execution_window_closed")
     worker.require(os.environ.get("QUEUE_ZERO_COST_VERIFIED") == "true" or not needs_api, "cost_gate")
     key = os.environ.get("BULKPUBLISH_API_KEY", "")
@@ -163,6 +224,8 @@ def run(repo, execute=False, mode="verify", now=None):
         api = worker.Transport(key)
         if mode == "verify":
             result = verify_existing(root, config, api)
+        elif mode == "delivery":
+            result = delivery_check(root, config, api, now, checkpoint)
         else:
             result = worker.run(root, config, api, now, checkpoint, execute)
         # Only generic result status/count; no account, text, provider IDs, or timestamps.
@@ -175,7 +238,7 @@ if __name__ == "__main__":
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--target", type=Path)
     p.add_argument("--execute", action="store_true")
-    p.add_argument("--mode", choices=["verify", "publish"], default="verify")
+    p.add_argument("--mode", choices=["verify", "publish", "delivery"], default="verify")
     a = p.parse_args()
     try:
         if a.command == "seal":
