@@ -1,3 +1,4 @@
+# Owner-authorized external scheduler integration.
 name: Encrypted approved cloud queue
 on:
   workflow_dispatch:
@@ -11,6 +12,7 @@ on:
           - verify
           - publish
           - delivery
+          - probe
   schedule:
     - cron: '17 7 2-29 11 *'
     - cron: '2 6 2 11 *'
@@ -42,8 +44,10 @@ jobs:
               allowed = os.environ['PUBLISH_ENABLED'] == 'true' and d.date(2026,11,2) <= day <= d.date(2026,11,29)
           if mode == 'delivery':
               allowed = day == d.date(2026,11,2) and now.hour >= 9
+          final_feed_day = allowed and mode == 'publish' and day == d.date(2026,11,29)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write('allowed=' + str(allowed).lower() + '\nmode=' + mode + '\n')
+              f.write('final_feed_day=' + str(final_feed_day).lower() + '\n')
           print('scheduler_probe_completed_no_api' if mode == 'probe' else 'date_and_mode_allowed' if allowed else 'date_or_mode_closed_no_api')
           PY
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -74,12 +78,28 @@ jobs:
           QUEUE_ZERO_COST_VERIFIED: ${{ vars.QUEUE_ZERO_COST_VERIFIED }}
         run: '"$RUNNER_TEMP/snap-publisher-venv/bin/python" sealed_runner.py run --root "$GITHUB_WORKSPACE" --mode verify'
       - name: Queue one approved item
+        id: queue_one_approved_item
         if: steps.guard.outputs.allowed == 'true' && steps.guard.outputs.mode == 'publish'
         env:
           SNAP_QUEUE_SEAL_KEY: ${{ secrets.SNAP_QUEUE_SEAL_KEY }}
           BULKPUBLISH_API_KEY: ${{ secrets.BULKPUBLISH_API_KEY }}
           QUEUE_ZERO_COST_VERIFIED: ${{ vars.QUEUE_ZERO_COST_VERIFIED }}
-        run: '"$RUNNER_TEMP/snap-publisher-venv/bin/python" sealed_runner.py run --root "$GITHUB_WORKSPACE" --mode publish --execute'
+        run: |
+          result=$("$RUNNER_TEMP/snap-publisher-venv/bin/python" sealed_runner.py run --root "$GITHUB_WORKSPACE" --mode publish --execute)
+          printf '%s\n' "$result"
+          QUEUE_RESULT="$result" python3 - <<'PY'
+          import json, os
+          created = json.loads(os.environ['QUEUE_RESULT']).get('status') == 'queued_verified_not_published'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('created=' + str(created).lower() + '\n')
+          PY
+      - name: Delete owner-approved QStash schedule after final new queue
+        if: success() && steps.guard.outputs.allowed == 'true' && steps.guard.outputs.mode == 'publish' && steps.guard.outputs.final_feed_day == 'true' && steps.queue_one_approved_item.outputs.created == 'true'
+        env:
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          QSTASH_SCHEDULE_ID: ${{ secrets.QSTASH_SCHEDULE_ID }}
+          QUEUE_ZERO_COST_VERIFIED: ${{ vars.QUEUE_ZERO_COST_VERIFIED }}
+        run: python3.12 qstash_cleanup.py --execute
       - name: One-off provider delivery check (two GETs)
         if: steps.guard.outputs.allowed == 'true' && steps.guard.outputs.mode == 'delivery'
         env:
