@@ -4,6 +4,7 @@
 !/README.md
 !/worker.py
 !/sealed_runner.py
+!/qstash_cleanup.py
 !/requirements.txt
 !/bundle.sealed
 !/state.sealed
