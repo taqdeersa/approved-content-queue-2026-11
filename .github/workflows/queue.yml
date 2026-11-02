@@ -13,10 +13,6 @@ on:
           - publish
           - delivery
           - probe
-  schedule:
-    - cron: '17 7 2-29 11 *'
-    - cron: '2 6 2 11 *'
-    - cron: '34 8 2 11 *'
 permissions:
   contents: write
 concurrency:
@@ -31,7 +27,7 @@ jobs:
       - name: Guard mode and year before checkout or install
         id: guard
         env:
-          QUEUE_MODE: ${{ github.event_name == 'schedule' && github.event.schedule == '17 7 2-29 11 *' && 'publish' || github.event_name == 'schedule' && github.event.schedule == '2 6 2 11 *' && 'delivery' || github.event_name == 'schedule' && 'probe' || inputs.mode || 'verify' }}
+          QUEUE_MODE: ${{ github.event_name == 'schedule' && 'probe' || inputs.mode || 'verify' }}
           PUBLISH_ENABLED: ${{ vars.CLOUD_PUBLISH_ENABLED }}
         run: |
           python3 - <<'PY'
