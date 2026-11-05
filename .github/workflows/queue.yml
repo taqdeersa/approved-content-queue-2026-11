@@ -80,6 +80,9 @@ jobs:
           SNAP_QUEUE_SEAL_KEY: ${{ secrets.SNAP_QUEUE_SEAL_KEY }}
           BULKPUBLISH_API_KEY: ${{ secrets.BULKPUBLISH_API_KEY }}
           QUEUE_ZERO_COST_VERIFIED: ${{ vars.QUEUE_ZERO_COST_VERIFIED }}
+          SNAP_PRO_COMPAT_ENABLED: ${{ vars.SNAP_PRO_COMPAT_ENABLED }}
+          SNAP_SHARED_PRO_ENTITLEMENT_VERIFIED: ${{ vars.SNAP_SHARED_PRO_ENTITLEMENT_VERIFIED }}
+          SNAP_SHARED_PRO_ENTITLEMENT_EVIDENCE_REF: ${{ vars.SNAP_SHARED_PRO_ENTITLEMENT_EVIDENCE_REF }}
         run: |
           result=$("$RUNNER_TEMP/snap-publisher-venv/bin/python" sealed_runner.py run --root "$GITHUB_WORKSPACE" --mode publish --execute)
           printf '%s\n' "$result"
