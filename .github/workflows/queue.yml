@@ -1,108 +1,34 @@
-# Owner-authorized external scheduler integration.
 name: Encrypted approved cloud queue
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Read-only verification or one approved queue creation
+        description: Read-only Pro entitlement and quota check
         type: choice
         required: true
         default: verify
         options:
           - verify
-          - publish
-          - delivery
-          - probe
 permissions:
-  contents: write
-concurrency:
-  group: sealed-snap-cloud-queue
-  cancel-in-progress: false
+  contents: read
 jobs:
-  queue:
-    if: vars.QUEUE_ZERO_COST_VERIFIED == 'true'
+  snap-pro-evidence:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/snap-pro-evidence-20261105' && github.repository == 'taqdeersa/approved-content-queue-2026-11' && github.event.repository.private == false && inputs.mode == 'verify'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Guard mode and year before checkout or install
-        id: guard
-        env:
-          QUEUE_MODE: ${{ github.event_name == 'schedule' && 'probe' || inputs.mode || 'verify' }}
-          PUBLISH_ENABLED: ${{ vars.CLOUD_PUBLISH_ENABLED }}
-        run: |
-          python3 - <<'PY'
-          import datetime as d, os
-          now = d.datetime.now(d.timezone(d.timedelta(hours=3)))
-          day = now.date()
-          mode = os.environ['QUEUE_MODE']
-          allowed = mode == 'verify' and d.date(2026,11,1) <= day <= d.date(2026,12,1)
-          if mode == 'publish':
-              allowed = os.environ['PUBLISH_ENABLED'] == 'true' and d.date(2026,11,2) <= day <= d.date(2026,11,29)
-          if mode == 'delivery':
-              allowed = day == d.date(2026,11,2) and now.hour >= 9
-          final_feed_day = allowed and mode == 'publish' and day == d.date(2026,11,29)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write('allowed=' + str(allowed).lower() + '\nmode=' + mode + '\n')
-              f.write('final_feed_day=' + str(final_feed_day).lower() + '\n')
-          print('scheduler_probe_completed_no_api' if mode == 'probe' else 'date_and_mode_allowed' if allowed else 'date_or_mode_closed_no_api')
-          PY
+      - name: Verify one-off date window
+        run: test "$(TZ=Asia/Riyadh date +%F)" = "2026-11-05"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        if: steps.guard.outputs.allowed == 'true'
         with:
-          fetch-depth: 0
-      - name: Verify public repository
-        if: steps.guard.outputs.allowed == 'true'
-        env:
-          IS_PRIVATE: ${{ github.event.repository.private }}
-        run: test "$IS_PRIVATE" = "false"
+          persist-credentials: false
       - name: Install pinned encryption dependency
-        if: steps.guard.outputs.allowed == 'true'
         run: |
           python3.12 -c 'import platform,sys; assert sys.version_info[:2] == (3,12) and platform.machine() == "x86_64"'
-          python3.12 -m venv "$RUNNER_TEMP/snap-publisher-venv"
-          "$RUNNER_TEMP/snap-publisher-venv/bin/python" -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements.txt
-      - name: Configure encrypted checkpoint identity
-        if: steps.guard.outputs.allowed == 'true' && steps.guard.outputs.mode != 'verify'
-        run: |
-          git config user.name 'Cloud queue checkpoint'
-          git config user.email 'queue@users.noreply.github.com'
-      - name: Read-only verification (two GETs)
-        if: steps.guard.outputs.allowed == 'true' && steps.guard.outputs.mode == 'verify'
+          python3.12 -m venv "$RUNNER_TEMP/snap-pro-evidence"
+          "$RUNNER_TEMP/snap-pro-evidence/bin/python" -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements.txt
+      - name: Read-only Pro evidence (five GETs)
         env:
           SNAP_QUEUE_SEAL_KEY: ${{ secrets.SNAP_QUEUE_SEAL_KEY }}
           BULKPUBLISH_API_KEY: ${{ secrets.BULKPUBLISH_API_KEY }}
-          QUEUE_ZERO_COST_VERIFIED: ${{ vars.QUEUE_ZERO_COST_VERIFIED }}
-        run: '"$RUNNER_TEMP/snap-publisher-venv/bin/python" sealed_runner.py run --root "$GITHUB_WORKSPACE" --mode verify'
-      - name: Queue one approved item
-        id: queue_one_approved_item
-        if: steps.guard.outputs.allowed == 'true' && steps.guard.outputs.mode == 'publish'
-        env:
-          SNAP_QUEUE_SEAL_KEY: ${{ secrets.SNAP_QUEUE_SEAL_KEY }}
-          BULKPUBLISH_API_KEY: ${{ secrets.BULKPUBLISH_API_KEY }}
-          QUEUE_ZERO_COST_VERIFIED: ${{ vars.QUEUE_ZERO_COST_VERIFIED }}
-          SNAP_PRO_COMPAT_ENABLED: ${{ vars.SNAP_PRO_COMPAT_ENABLED }}
-          SNAP_SHARED_PRO_ENTITLEMENT_VERIFIED: ${{ vars.SNAP_SHARED_PRO_ENTITLEMENT_VERIFIED }}
-          SNAP_SHARED_PRO_ENTITLEMENT_EVIDENCE_REF: ${{ vars.SNAP_SHARED_PRO_ENTITLEMENT_EVIDENCE_REF }}
-        run: |
-          result=$("$RUNNER_TEMP/snap-publisher-venv/bin/python" sealed_runner.py run --root "$GITHUB_WORKSPACE" --mode publish --execute)
-          printf '%s\n' "$result"
-          QUEUE_RESULT="$result" python3 - <<'PY'
-          import json, os
-          created = json.loads(os.environ['QUEUE_RESULT']).get('status') == 'queued_verified_not_published'
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write('created=' + str(created).lower() + '\n')
-          PY
-      - name: Delete owner-approved QStash schedule after final new queue
-        if: success() && steps.guard.outputs.allowed == 'true' && steps.guard.outputs.mode == 'publish' && steps.guard.outputs.final_feed_day == 'true' && steps.queue_one_approved_item.outputs.created == 'true'
-        env:
-          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
-          QSTASH_SCHEDULE_ID: ${{ secrets.QSTASH_SCHEDULE_ID }}
-          QUEUE_ZERO_COST_VERIFIED: ${{ vars.QUEUE_ZERO_COST_VERIFIED }}
-        run: python3.12 qstash_cleanup.py --execute
-      - name: One-off provider delivery check (two GETs)
-        if: steps.guard.outputs.allowed == 'true' && steps.guard.outputs.mode == 'delivery'
-        env:
-          SNAP_QUEUE_SEAL_KEY: ${{ secrets.SNAP_QUEUE_SEAL_KEY }}
-          BULKPUBLISH_API_KEY: ${{ secrets.BULKPUBLISH_API_KEY }}
-          QUEUE_ZERO_COST_VERIFIED: ${{ vars.QUEUE_ZERO_COST_VERIFIED }}
-        run: '"$RUNNER_TEMP/snap-publisher-venv/bin/python" sealed_runner.py run --root "$GITHUB_WORKSPACE" --mode delivery'
+        run: '"$RUNNER_TEMP/snap-pro-evidence/bin/python" snap_pro_readback.py'
