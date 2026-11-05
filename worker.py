@@ -202,6 +202,43 @@ def candidate(root, manifest, state, now):
     return item
 
 
+def pro_capacity(root, manifest, item, config, quota, usage, contract):
+    """Explicit Pro compatibility; this worker retains its original Snap scope."""
+    require(os.environ.get("SNAP_PRO_COMPAT_ENABLED") == "true"
+            and config.get("channel_id") == 4659, "pro_compat_not_authorized")
+    # Separate financial entitlement from the original zero-incremental-cost gate.
+    # This is an operator-attested reference digest, never a credential or a URL.
+    entitlement_ref = os.environ.get("SNAP_SHARED_PRO_ENTITLEMENT_EVIDENCE_REF", "")
+    require(os.environ.get("SNAP_SHARED_PRO_ENTITLEMENT_VERIFIED") == "true"
+            and entitlement_ref.startswith("sha256:") and len(entitlement_ref) == 71
+            and all(char in "0123456789abcdef" for char in entitlement_ref[7:]),
+            "pro_entitlement_not_verified")
+    api_limit, api_used = pointer(usage, contract["api_limit"]), pointer(usage, contract["api_used"])
+    require(type(api_limit) is int and api_limit >= 10 and type(api_used) is int
+            and 0 <= api_used <= api_limit - 4, "api_quota")
+    lim, used = quota.get("limits", {}), quota.get("usage", {})
+    for limit_key, usage_key, minimum in (("postsPerDay", "postsToday", 1),
+                                         ("postsPerMonth", "postsThisMonth", 30),
+                                         ("scheduledPerDay", "scheduledToday", 1)):
+        limit, count = lim.get(limit_key), used.get(usage_key)
+        require(type(limit) is int and limit >= minimum and type(count) is int
+                and 0 <= count < limit, "pro_capacity_or_unknown_shape")
+    pending_limit, pending = lim.get("maxPendingScheduled"), used.get("pendingScheduled")
+    require(type(pending_limit) is int and (pending_limit == -1 or pending_limit >= 3)
+            and type(pending) is int and pending >= 0
+            and (pending_limit == -1 or pending < pending_limit), "pro_pending_capacity")
+    storage_limit, storage = lim.get("mediaStorageMB"), used.get("mediaStorageMB")
+    require(type(storage_limit) in (int, float) and 100 <= storage_limit < float("inf")
+            and type(storage) in (int, float) and 0 <= storage < storage_limit
+            and storage + (root / item["asset"]).stat().st_size / 1000000 < storage_limit,
+            "pro_storage_capacity")
+    # Keep the frozen Snapchat bundle below its old 100 MB operational budget.
+    assets = [(root / item["asset"]).resolve() for item in manifest["items"]]
+    require(all(path.is_relative_to(root.resolve()) for path in assets)
+            and sum(path.stat().st_size for path in assets) / 1000000 < 100,
+            "snap_media_budget")
+
+
 def run(root, config, api, now, save, execute=False):
     manifest = read(root / "manifest.json")
     state = read(root / "state.json") if (root / "state.json").exists() else {"schema": 1, "items": {}}
@@ -234,29 +271,41 @@ def run(root, config, api, now, save, execute=False):
             and channels["capabilities"].get("canPublishPosts") is True, "identity_or_channel_health")
     quota = api.call("GET", "/api/quotas/usage")
     usage = api.call("GET", "/api/api-keys/usage")
-    require(pointer(usage, c["plan"]) == "free", "not_free_plan")
-    require(pointer(usage, c["api_limit"]) == 10 and pointer(usage, c["api_used"]) <= 6, "api_quota")
-    lim, used = quota.get("limits", {}), quota.get("usage", {})
-    require(lim.get("postsPerDay") == 1 and used.get("postsToday") == 0
-            and used.get("postsThisMonth", 30) < 30 and lim.get("maxPendingScheduled") == 3
-            and used.get("pendingScheduled", 3) < 3
-            and used.get("mediaStorageMB", 100) + (root / item["asset"]).stat().st_size / 1000000 < 100,
-            "free_quota_or_unknown_shape")
+    plan = pointer(usage, c["plan"])
+    require(plan in ("free", "pro"), "unsupported_plan")
+    if plan == "pro":
+        pro_capacity(root, manifest, item, config, quota, usage, c)
+    else:
+        require(pointer(usage, c["api_limit"]) == 10 and pointer(usage, c["api_used"]) <= 6, "api_quota")
+        lim, used = quota.get("limits", {}), quota.get("usage", {})
+        require(lim.get("postsPerDay") == 1 and used.get("postsToday") == 0
+                and used.get("postsThisMonth", 30) < 30 and lim.get("maxPendingScheduled") == 3
+                and used.get("pendingScheduled", 3) < 3
+                and used.get("mediaStorageMB", 100) + (root / item["asset"]).stat().st_size / 1000000 < 100,
+                "free_quota_or_unknown_shape")
     posts_path = "/api/posts?" + urllib.parse.urlencode({"channelId": ch["id"], "limit": 500})
     posts = api.call("GET", posts_path)
     require(posts.get("totalPages") == 1 or posts.get("total") == 0, "pagination_requires_review")
     rows = posts["posts"]
+    if plan == "pro":
+        require(all(isinstance(p.get("postPlatforms"), list) and len(p["postPlatforms"]) == 1
+                    and p["postPlatforms"][0].get("channelId") == 4659
+                    and p["postPlatforms"][0].get("platform") == "snapchat" for p in rows),
+                "snap_posts_filter_unverified")
     require(sum(p["status"] in ("scheduled", "publishing", "processing") for p in rows) < 3, "remote_queue_full")
     # Story captions are not forwarded to Snapchat. Short frozen approved title
     # is provider metadata; full approved on-image copy remains hash-checked.
     text_value = item["title"]
+    snap_this_month = 0
     for p in rows:
         created = dt.datetime.fromisoformat(p["createdAt"].replace("Z", "+00:00"))
+        snap_this_month += created.astimezone(dt.timezone.utc).strftime("%Y-%m") == now.astimezone(dt.timezone.utc).strftime("%Y-%m")
         require(created.astimezone(dt.timezone.utc).date() != now.astimezone(dt.timezone.utc).date()
                 and created.astimezone(RIYADH).date() != now.astimezone(RIYADH).date(), "remote_creation_today")
         remote_time = p.get("scheduledAt")
         same_time = remote_time is not None and dt.datetime.fromisoformat(remote_time.replace("Z", "+00:00")) == dt.datetime.fromisoformat(item["scheduled_at"])
         require(not (same_time or p.get("content") == text_value), "remote_duplicate_requires_review")
+    require(plan != "pro" or snap_this_month < 30, "snap_monthly_cap")
     entry = {"phase": "upload_pending", "utc_day": now.astimezone(dt.timezone.utc).date().isoformat(),
              "riyadh_day": now.astimezone(RIYADH).date().isoformat(), "asset_sha256": item["asset_sha256"],
              "scheduled_at": item["scheduled_at"], "attempt_id": uuid.uuid4().hex}
