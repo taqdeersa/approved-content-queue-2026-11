@@ -1,0 +1,10 @@
+{
+  "plan": "pro",
+  "currency": "USD",
+  "total_usd": "16.09",
+  "cycle_count": 1,
+  "paid_through_riyadh_date": "2026-12-05",
+  "paid_period_end_utc": "2026-12-05T07:48:20.818Z",
+  "receipt_evidence_ref": "sha256:38aa8cc75229b962cfeb6a19a3e96ddb7666fccf5ffa8051a09049aa39943809",
+  "cancellation_evidence_ref": "sha256:8c966120c03342ae27fcdec71c73e5d0043d6d17ad7ed4b08f012aac65844349"
+}
