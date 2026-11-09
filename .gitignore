@@ -4,6 +4,7 @@
 !/README.md
 !/worker.py
 !/sealed_runner.py
+!/public_story_probe.mjs
 !/qstash_cleanup.py
 !/requirements.txt
 !/bundle.sealed

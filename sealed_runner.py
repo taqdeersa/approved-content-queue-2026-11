@@ -209,6 +209,20 @@ def verify_audible_route(root, config, api, now):
     return {"status": "audible_cloud_probe_verified_read_only", "requests": api.count}
 
 
+def verify_public_story_route(repo, config):
+    check = subprocess.run(
+        ["node", str(repo / "public_story_probe.mjs"), config["verified_username"],
+         "2026-11-09T14:29:54+03:00", "2026-11-09T14:30:05+03:00"],
+        check=False, capture_output=True, timeout=40,
+        env={"PATH": os.environ["PATH"]},
+    )
+    result = json.loads(check.stdout)
+    worker.require(check.returncode == 0 and result.get("status") == "public_media_prefix_verified"
+                   and result.get("profile_verified") is True and result.get("match_count") == 3
+                   and all(item["media"] == "video" for item in result["entries"]),
+                   "audible_probe_public_story_unverified")
+
+
 def delivery_check(root, config, api, now, checkpoint):
     """One reserved read-only provider check; only encrypted checkpoint writes."""
     worker.require(execution_window(now, "delivery"), "delivery_window_closed")
@@ -292,15 +306,16 @@ def run(repo, execute=False, mode="verify", now=None):
                 result = subprocess.run(["git", "-C", str(repo)] + args, capture_output=True, timeout=30)
                 worker.require(result.returncode == 0, "encrypted_checkpoint_not_persisted")
 
-        api = AudibleProbeTransport(key) if audible_probe else worker.Transport(key)
         if audible_probe:
-            result = verify_audible_route(root, config, api, now)
+            result = verify_audible_route(root, config, AudibleProbeTransport(key), now)
+            verify_public_story_route(repo, config)
+            result["status"] = "audible_cloud_provider_and_public_story_read_only"
         elif mode == "verify":
-            result = verify_existing(root, config, api)
+            result = verify_existing(root, config, worker.Transport(key))
         elif mode == "delivery":
-            result = delivery_check(root, config, api, now, checkpoint)
+            result = delivery_check(root, config, worker.Transport(key), now, checkpoint)
         else:
-            result = worker.run(root, config, api, now, checkpoint, execute)
+            result = worker.run(root, config, worker.Transport(key), now, checkpoint, execute)
         # Only generic result status/count; no account, text, provider IDs, or timestamps.
         print(json.dumps({"status": result["status"], "requests": result.get("requests", 0)}))
 
