@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import zipfile
@@ -15,6 +16,7 @@ BUNDLE_AAD = b"approved-snap-cloud-bundle-v1"
 STATE_AAD = b"approved-snap-cloud-state-v1"
 MAX_BUNDLE_BYTES = 64 * 1024 * 1024
 MAX_STATE_BYTES = 1024 * 1024
+AUDIBLE_PROBE_REF = "refs/heads/codex/snap-audible-november"
 
 
 def cipher():
@@ -144,6 +146,62 @@ def verify_existing(root, config, api):
     return {"status": "verified_existing_post_read_only", "requests": api.count}
 
 
+class AudibleProbeTransport(worker.Transport):
+    def call(self, method, path, body=None, content_type="application/json"):
+        allowed = path in ("/api/api-keys/usage", "/api/quotas/usage", "/api/channels")
+        worker.require(method == "GET" and body is None and self.count < 5
+                       and (allowed or re.fullmatch(r"/api/posts/[1-9][0-9]*", path)),
+                       "audible_probe_read_only")
+        result = super().call(method, path, body, content_type)
+        if path == "/api/channels":
+            capabilities = result.get("capabilities", {})
+            worker.require(capabilities.get("canCreatePosts") is True
+                           and capabilities.get("canPublishPosts") is True, "audible_probe_write_scope")
+        return result
+
+
+def verify_audible_route(root, config, api, now):
+    state, _, _ = verification_context(root, config)
+    manifest = worker.read(root / "manifest.json")
+    contract = config["response_contract"]
+    worker.require(all(isinstance(contract.get(key), list) for key in ("plan", "api_limit", "api_used")),
+                   "audible_probe_unverified_usage_schema")
+    usage = api.call("GET", "/api/api-keys/usage")
+    limit = worker.pointer(usage, contract["api_limit"])
+    used = worker.pointer(usage, contract["api_used"])
+    worker.require(worker.pointer(usage, contract["plan"]) == "pro"
+                   and type(limit) is int and type(used) is int and 0 <= used <= limit - 15,
+                   "audible_probe_no_safe_plan_headroom")
+    quota = api.call("GET", "/api/quotas/usage")
+    worker.require(quota["limits"]["postsPerDay"] > quota["usage"]["postsToday"]
+                   and quota["limits"]["postsPerMonth"] > quota["usage"]["postsThisMonth"],
+                   "audible_probe_no_post_headroom")
+    day = now.astimezone(worker.RIYADH).day
+    items = {item["day"]: item for item in manifest["items"]}
+    for item in (items[day], items[day + 1]):
+        entry = state["items"][str(item["day"])]
+        worker.require(entry["phase"] == "queued_verified" and entry["scheduled_at"] == item["scheduled_at"]
+                       and entry["asset_sha256"] == item["asset_sha256"]
+                       and type(entry["provider_post_id"]) is int and entry["provider_post_id"] > 0
+                       and type(entry["media_id"]) is int and entry["media_id"] > 0,
+                       "audible_probe_silent_checkpoint_mismatch")
+    post = read_existing(root, config, api, statuses=("published",), context=(state, items[day], state["items"][str(day)]))
+    snap = post["postPlatforms"][0]
+    published_at = snap.get("publishedAt") or post.get("publishedAt")
+    worker.require(snap.get("status") == "published" and isinstance(snap.get("platformPostId"), str)
+                   and snap["platformPostId"].strip() and isinstance(published_at, str)
+                   and dt.datetime.fromisoformat(items[day]["scheduled_at"])
+                   <= dt.datetime.fromisoformat(published_at.replace("Z", "+00:00")) <= now,
+                   "audible_probe_missing_platform_delivery_receipt")
+    next_entry = state["items"][str(day + 1)]
+    next_id = next_entry["provider_post_id"]
+    response = api.call("GET", f"/api/posts/{next_id}")
+    queued = worker.pointer(response, contract["read_post"])
+    worker.require(worker.exact_scheduled_post(queued, items[day + 1], config["channel_id"], next_entry["media_id"], next_id),
+                   "audible_probe_next_silent_post_not_scheduled")
+    return {"status": "audible_cloud_probe_verified_read_only", "requests": api.count}
+
+
 def delivery_check(root, config, api, now, checkpoint):
     """One reserved read-only provider check; only encrypted checkpoint writes."""
     worker.require(execution_window(now, "delivery"), "delivery_window_closed")
@@ -193,6 +251,12 @@ def delivery_check(root, config, api, now, checkpoint):
 
 def run(repo, execute=False, mode="verify", now=None):
     now = now or dt.datetime.now(worker.RIYADH)
+    audible_probe = os.environ.get("GITHUB_REF") == AUDIBLE_PROBE_REF
+    if audible_probe:
+        worker.require(mode == "verify" and not execute
+                       and os.environ.get("GITHUB_REPOSITORY") == "taqdeersa/approved-content-queue-2026-11"
+                       and now.astimezone(worker.RIYADH).date() == dt.date(2026, 11, 9),
+                       "audible_probe_scope_or_mode")
     worker.require(mode in ("verify", "publish", "delivery") and not (mode != "publish" and execute), "read_only_mode_cannot_execute")
     needs_api = mode in ("verify", "delivery") or execute
     worker.require(not needs_api or execution_window(now, mode), "execution_window_closed")
@@ -221,8 +285,10 @@ def run(repo, execute=False, mode="verify", now=None):
                 result = subprocess.run(["git", "-C", str(repo)] + args, capture_output=True, timeout=30)
                 worker.require(result.returncode == 0, "encrypted_checkpoint_not_persisted")
 
-        api = worker.Transport(key)
-        if mode == "verify":
+        api = AudibleProbeTransport(key) if audible_probe else worker.Transport(key)
+        if audible_probe:
+            result = verify_audible_route(root, config, api, now)
+        elif mode == "verify":
             result = verify_existing(root, config, api)
         elif mode == "delivery":
             result = delivery_check(root, config, api, now, checkpoint)
