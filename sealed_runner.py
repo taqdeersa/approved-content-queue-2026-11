@@ -120,7 +120,7 @@ def verification_context(root, config):
     return state, item, entry
 
 
-def read_existing(root, config, api, statuses=("scheduled", "published"), context=None):
+def read_existing(root, config, api, statuses=("scheduled", "published"), context=None, check_media_metadata=True):
     """Two GETs only, returning private data to the encrypted caller."""
     state, item, entry = context or verification_context(root, config)
     channels = api.call("GET", "/api/channels")
@@ -136,8 +136,9 @@ def read_existing(root, config, api, statuses=("scheduled", "published"), contex
     worker.require(worker.exact_scheduled_post(post, item, channel["id"], entry["media_id"],
                    entry["provider_post_id"], statuses=statuses), "verify_post_mismatch")
     media = post["mediaFiles"][0]
-    worker.require(media.get("mimeType") == entry.get("provider_mime_type")
-                   and media.get("sizeBytes") == entry.get("provider_size_bytes"), "verify_media_metadata_changed")
+    if check_media_metadata:
+        worker.require(media.get("mimeType") == entry.get("provider_mime_type")
+                       and media.get("sizeBytes") == entry.get("provider_size_bytes"), "verify_media_metadata_changed")
     return post
 
 
@@ -185,7 +186,13 @@ def verify_audible_route(root, config, api, now):
                        and type(entry["provider_post_id"]) is int and entry["provider_post_id"] > 0
                        and type(entry["media_id"]) is int and entry["media_id"] > 0,
                        "audible_probe_silent_checkpoint_mismatch")
-    post = read_existing(root, config, api, statuses=("published",), context=(state, items[day], state["items"][str(day)]))
+    # The later silent checkpoints pin the exact media ID without storing
+    # provider MIME and size. Those extra fields are pinned for day two.
+    post = read_existing(root, config, api, statuses=("published",),
+                         context=(state, items[day], state["items"][str(day)]), check_media_metadata=False)
+    media = post["mediaFiles"][0]
+    worker.require(media.get("mimeType") == "video/mp4" and type(media.get("sizeBytes")) is int
+                   and media["sizeBytes"] > 0, "audible_probe_live_media_metadata_missing")
     snap = post["postPlatforms"][0]
     published_at = snap.get("publishedAt") or post.get("publishedAt")
     worker.require(snap.get("status") == "published" and isinstance(snap.get("platformPostId"), str)
@@ -312,6 +319,11 @@ if __name__ == "__main__":
             seal(a.root.resolve(), a.target.resolve())
         else:
             run(a.root.resolve(), a.execute, a.mode)
-    except Exception:
+    except Exception as error:
+        if os.environ.get("GITHUB_REF") == AUDIBLE_PROBE_REF:
+            reason = str(error) if isinstance(error, worker.Halt) else "audible_probe_unexpected_schema"
+            if not re.fullmatch(r"(?:audible_probe_|verify_|http_or_json_result_unknown_)[a-zA-Z0-9_]{1,75}", reason):
+                reason = "audible_probe_runtime_gate"
+            print(json.dumps({"status": "audible_cloud_probe_halted", "reason": reason}))
         print('{"status":"halt","reason":"sealed_runner_gate_or_result_unknown"}')
         raise SystemExit(2)
