@@ -239,7 +239,61 @@ def pro_capacity(root, manifest, item, config, quota, usage, contract):
             "snap_media_budget")
 
 
-def run(root, config, api, now, save, execute=False):
+def verified_audible_ids(posts, receipts, state, channel_id):
+    """Exempt only exact readback-confirmed records from the independent audible lane."""
+    require(isinstance(receipts, list) and len(receipts) <= 62, "audible_receipts_invalid")
+    own_ids = {entry.get("provider_post_id") for entry in state["items"].values()}
+    remote = {post["id"]: post for post in posts}
+    require(len(remote) == len(posts), "snap_posts_inventory_ambiguous")
+    declared, verified = set(), set()
+    for receipt in receipts:
+        require(isinstance(receipt, dict), "audible_receipt_invalid")
+        post_id, media_id = receipt.get("post_id"), receipt.get("media_id")
+        require(type(post_id) is int and post_id > 0 and type(media_id) is int and media_id > 0
+                and post_id not in own_ids and post_id not in declared
+                and receipt.get("phase") == "queued_verified"
+                and isinstance(receipt.get("created_at"), str)
+                and isinstance(receipt.get("scheduled_at"), str)
+                and isinstance(receipt.get("title"), str) and 0 < len(receipt["title"]) <= 160,
+                "audible_receipt_invalid")
+        try:
+            created_at = dt.datetime.fromisoformat(receipt["created_at"].replace("Z", "+00:00"))
+            scheduled_at = dt.datetime.fromisoformat(receipt["scheduled_at"])
+        except ValueError:
+            raise Halt("audible_receipt_timestamp_invalid") from None
+        require(created_at.utcoffset() is not None and scheduled_at.utcoffset() == dt.timedelta(hours=3)
+                and created_at < scheduled_at, "audible_receipt_timestamp_invalid")
+        declared.add(post_id)
+        post = remote.get(post_id)
+        if post and post.get("createdAt") == receipt["created_at"] and exact_scheduled_post(
+                post, receipt, channel_id, media_id, expected_id=post_id,
+                statuses=("scheduled", "processing", "publishing", "published", "failed", "partial")):
+            verified.add(post_id)
+    return verified
+
+
+def check_channel_inventory(rows, item, now, plan, audible_ids=()):
+    if plan != "pro":
+        audible_ids = ()
+    own_rows = [post for post in rows if post.get("id") not in audible_ids]
+    require(sum(p["status"] in ("scheduled", "publishing", "processing") for p in own_rows)
+            < 3, "remote_queue_full")
+    snap_this_month = 0
+    for p in own_rows:
+        created = dt.datetime.fromisoformat(p["createdAt"].replace("Z", "+00:00"))
+        snap_this_month += created.astimezone(dt.timezone.utc).strftime("%Y-%m") == now.astimezone(dt.timezone.utc).strftime("%Y-%m")
+        require(created.astimezone(dt.timezone.utc).date() != now.astimezone(dt.timezone.utc).date()
+                and created.astimezone(RIYADH).date() != now.astimezone(RIYADH).date(), "remote_creation_today")
+    require(plan != "pro" or snap_this_month < 30, "snap_monthly_cap")
+    target_time = dt.datetime.fromisoformat(item["scheduled_at"])
+    for p in rows:
+        remote_time = p.get("scheduledAt")
+        same_time = (remote_time is not None
+                     and dt.datetime.fromisoformat(remote_time.replace("Z", "+00:00")) == target_time)
+        require(not (same_time or p.get("content") == item["title"]), "remote_duplicate_requires_review")
+
+
+def run(root, config, api, now, save, execute=False, audible_receipts=None):
     manifest = read(root / "manifest.json")
     state = read(root / "state.json") if (root / "state.json").exists() else {"schema": 1, "items": {}}
     item = candidate(root, manifest, state, now)
@@ -292,20 +346,14 @@ def run(root, config, api, now, save, execute=False):
                     and p["postPlatforms"][0].get("channelId") == 4659
                     and p["postPlatforms"][0].get("platform") == "snapchat" for p in rows),
                 "snap_posts_filter_unverified")
-    require(sum(p["status"] in ("scheduled", "publishing", "processing") for p in rows) < 3, "remote_queue_full")
-    # Story captions are not forwarded to Snapchat. Short frozen approved title
-    # is provider metadata; full approved on-image copy remains hash-checked.
+    audible_ids = ()
+    if plan == "pro" and audible_receipts is not None:
+        require(type(posts.get("total")) is int and len(rows) == posts["total"],
+                "snap_posts_inventory_incomplete")
+        audible_ids = verified_audible_ids(rows, audible_receipts, state, ch["id"])
+    check_channel_inventory(rows, item, now, plan, audible_ids)
+    # Story captions are not forwarded to Snapchat. The frozen title is provider metadata.
     text_value = item["title"]
-    snap_this_month = 0
-    for p in rows:
-        created = dt.datetime.fromisoformat(p["createdAt"].replace("Z", "+00:00"))
-        snap_this_month += created.astimezone(dt.timezone.utc).strftime("%Y-%m") == now.astimezone(dt.timezone.utc).strftime("%Y-%m")
-        require(created.astimezone(dt.timezone.utc).date() != now.astimezone(dt.timezone.utc).date()
-                and created.astimezone(RIYADH).date() != now.astimezone(RIYADH).date(), "remote_creation_today")
-        remote_time = p.get("scheduledAt")
-        same_time = remote_time is not None and dt.datetime.fromisoformat(remote_time.replace("Z", "+00:00")) == dt.datetime.fromisoformat(item["scheduled_at"])
-        require(not (same_time or p.get("content") == text_value), "remote_duplicate_requires_review")
-    require(plan != "pro" or snap_this_month < 30, "snap_monthly_cap")
     entry = {"phase": "upload_pending", "utc_day": now.astimezone(dt.timezone.utc).date().isoformat(),
              "riyadh_day": now.astimezone(RIYADH).date().isoformat(), "asset_sha256": item["asset_sha256"],
              "scheduled_at": item["scheduled_at"], "attempt_id": uuid.uuid4().hex}

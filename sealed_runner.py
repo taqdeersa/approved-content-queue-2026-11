@@ -13,6 +13,11 @@ import worker
 
 BUNDLE_AAD = b"approved-snap-cloud-bundle-v1"
 STATE_AAD = b"approved-snap-cloud-state-v1"
+AUDIBLE_RECEIPTS_AAD = b"approved-snap-audible-receipts-v1"
+AUDIBLE_RECEIPTS_ORIGIN = b"https://github.com/taqdeersa/approved-content-queue-2026-11"
+AUDIBLE_RECEIPTS_SOURCE = "refs/heads/codex/snap-audible-media-stage"
+AUDIBLE_RECEIPTS_TRACKING = "refs/snap-audible/receipt-source"
+AUDIBLE_RECEIPTS_OBJECT = AUDIBLE_RECEIPTS_TRACKING + ":audible-receipts.sealed"
 MAX_BUNDLE_BYTES = 64 * 1024 * 1024
 MAX_STATE_BYTES = 1024 * 1024
 
@@ -33,6 +38,51 @@ def encrypt(data, aad=BUNDLE_AAD):
 def decrypt(data, aad=BUNDLE_AAD):
     worker.require(28 <= len(data) <= MAX_BUNDLE_BYTES + 28, "sealed_size_invalid")
     return cipher().decrypt(data[:12], data[12:], aad)
+
+
+def receipt_git(repo, *args):
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise worker.Halt("audible_receipts_git_unavailable") from None
+    worker.require(completed.returncode == 0, "audible_receipts_git_failed")
+    return completed.stdout
+
+
+def read_audible_receipts(repo):
+    """Refresh only the approved branch and authenticate its bounded receipt blob."""
+    from cryptography.exceptions import InvalidTag
+
+    origin = receipt_git(repo, "remote", "get-url", "origin").strip()
+    worker.require(origin in (AUDIBLE_RECEIPTS_ORIGIN, AUDIBLE_RECEIPTS_ORIGIN + b".git"),
+                   "audible_receipts_origin_mismatch")
+    receipt_git(repo, "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+                "-c", "http.followRedirects=false", "fetch", "--quiet", "--no-tags",
+                "--no-write-fetch-head", "--no-recurse-submodules", "--no-auto-gc", "--refmap=",
+                "origin", f"{AUDIBLE_RECEIPTS_SOURCE}:{AUDIBLE_RECEIPTS_TRACKING}")
+    raw_size = receipt_git(repo, "cat-file", "-s", AUDIBLE_RECEIPTS_OBJECT).strip()
+    worker.require(0 < len(raw_size) <= 7 and raw_size.isdigit(), "audible_receipts_size_invalid")
+    size = int(raw_size)
+    worker.require(28 <= size <= MAX_STATE_BYTES + 28, "audible_receipts_size_invalid")
+    blob = receipt_git(repo, "cat-file", "blob", AUDIBLE_RECEIPTS_OBJECT)
+    worker.require(len(blob) == size, "audible_receipts_size_changed")
+    try:
+        receipts = json.loads(decrypt(blob, AUDIBLE_RECEIPTS_AAD))
+    except (InvalidTag, ValueError, KeyError):
+        raise worker.Halt("audible_receipts_authentication_or_json_failed") from None
+    worker.require(isinstance(receipts, list) and len(receipts) <= 62, "audible_receipts_invalid")
+    return receipts
+
+
+def load_audible_receipts(repo, root, config, execute):
+    if not execute or os.environ.get("SNAP_SHARED_AUDIBLE_RECEIPTS_ENABLED") != "true":
+        return None
+    worker.require(os.environ.get("SNAP_PRO_COMPAT_ENABLED") == "true",
+                   "audible_receipts_require_pro_compatibility")
+    receipts = read_audible_receipts(repo)
+    worker.verified_audible_ids([], receipts, worker.read(root / "state.json"), config["channel_id"])
+    return receipts
 
 
 def extract_bundle(data, root):
@@ -193,6 +243,16 @@ def delivery_check(root, config, api, now, checkpoint):
 
 def run(repo, execute=False, mode="verify", now=None):
     now = now or dt.datetime.now(worker.RIYADH)
+    if os.environ.get("GITHUB_REF") == "refs/heads/codex/snap-audible-compat-rehearsal":
+        worker.require(mode == "verify" and not execute
+                       and os.environ.get("GITHUB_REPOSITORY") == "taqdeersa/approved-content-queue-2026-11"
+                       and now.astimezone(worker.RIYADH).date() == dt.date(2026, 11, 10)
+                       and os.environ.get("QUEUE_ZERO_COST_VERIFIED") == "true",
+                       "audible_receipt_rehearsal_scope")
+        receipts = read_audible_receipts(repo)
+        worker.require(receipts == [], "audible_receipt_rehearsal_nonempty")
+        print('{"status":"silent_cloud_read_audible_receipts","count":0,"provider_requests":0}')
+        return
     worker.require(mode in ("verify", "publish", "delivery") and not (mode != "publish" and execute), "read_only_mode_cannot_execute")
     needs_api = mode in ("verify", "delivery") or execute
     worker.require(not needs_api or execution_window(now, mode), "execution_window_closed")
@@ -227,7 +287,8 @@ def run(repo, execute=False, mode="verify", now=None):
         elif mode == "delivery":
             result = delivery_check(root, config, api, now, checkpoint)
         else:
-            result = worker.run(root, config, api, now, checkpoint, execute)
+            audible_receipts = load_audible_receipts(repo, root, config, execute)
+            result = worker.run(root, config, api, now, checkpoint, execute, audible_receipts=audible_receipts)
         # Only generic result status/count; no account, text, provider IDs, or timestamps.
         print(json.dumps({"status": result["status"], "requests": result.get("requests", 0)}))
 
