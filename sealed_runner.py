@@ -15,6 +15,7 @@ BUNDLE_AAD = b"approved-snap-cloud-bundle-v1"
 STATE_AAD = b"approved-snap-cloud-state-v1"
 MAX_BUNDLE_BYTES = 64 * 1024 * 1024
 MAX_STATE_BYTES = 1024 * 1024
+AUDIBLE_MEDIA_STAGE_REF = "refs/heads/codex/snap-audible-media-stage"
 
 
 def cipher():
@@ -193,6 +194,16 @@ def delivery_check(root, config, api, now, checkpoint):
 
 def run(repo, execute=False, mode="verify", now=None):
     now = now or dt.datetime.now(worker.RIYADH)
+    if os.environ.get("GITHUB_REF") == AUDIBLE_MEDIA_STAGE_REF:
+        import audible_envelope
+
+        worker.require(os.environ.get("GITHUB_REPOSITORY") == "taqdeersa/approved-content-queue-2026-11"
+                       and now.astimezone(worker.RIYADH).date() == dt.date(2026, 11, 10)
+                       and os.environ.get("QUEUE_ZERO_COST_VERIFIED") == "true"
+                       and mode == "verify" and not execute, "audible_media_key_probe_scope")
+        receiver = audible_envelope.runner_receiver(os.environ["SNAP_QUEUE_SEAL_KEY"])
+        print("AUDIBLE_RECEIVER_PUBLIC_V1=" + base64.b64encode(audible_envelope.public_bytes(receiver)).decode("ascii"))
+        return
     worker.require(mode in ("verify", "publish", "delivery") and not (mode != "publish" and execute), "read_only_mode_cannot_execute")
     needs_api = mode in ("verify", "delivery") or execute
     worker.require(not needs_api or execution_window(now, mode), "execution_window_closed")
