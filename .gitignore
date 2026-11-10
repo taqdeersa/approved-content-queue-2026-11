@@ -9,6 +9,8 @@
 !/audible_schedule_preflight.py
 !/audible-media-stage.sealed
 !/audible-media-stage-state.sealed
+!/audible-media-supplement.sealed
+!/audible-media-supplement-state.sealed
 !/audible-receipts.sealed
 !/audible-calendar.sealed
 !/qstash_cleanup.py

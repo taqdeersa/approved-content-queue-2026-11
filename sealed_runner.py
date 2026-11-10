@@ -20,6 +20,7 @@ MAX_STATE_BYTES = 1024 * 1024
 AUDIBLE_MEDIA_STAGE_REF = "refs/heads/codex/snap-audible-media-stage"
 AUDIBLE_MEDIA_STAGE_AAD = b"approved-snap-audible-media-stage-state-v1"
 AUDIBLE_MEDIA_BUNDLE_SHA = "2d3164511fd9d367239e3c205835e540a66bce62f33aa002c9434f4aaec38586"
+AUDIBLE_MEDIA_SUPPLEMENT_SHA = "a7e60def911f5778b230164b6094e64131efd35b6ea5870ff503fd56b75b262c"
 AUDIBLE_CALENDAR_SHA = "1f3eb703fec69b09d45bc74680e769fe4903221c4e0e95fbf81287ad668ee66e"
 AUDIBLE_RECEIPTS_AAD = b"approved-snap-audible-receipts-v1"
 
@@ -284,30 +285,35 @@ def run_audible_media_stage(repo, execute, mode, now):
         print("AUDIBLE_RECEIVER_PUBLIC_V1=" + base64.b64encode(audible_envelope.public_bytes(receiver)).decode("ascii"))
         return
     worker.require(not dt.time(10, 10) <= local.time() <= dt.time(10, 25), "media_stage_silent_window_reserved")
-    if mode == "verify":
+    supplemental_bundle = repo / "audible-media-supplement.sealed"
+    supplemental = supplemental_bundle.exists()
+    if mode == "verify" and not supplemental:
         verify_audible_calendar(repo, receiver, now)
         return
-    if (repo / "audible-calendar.sealed").exists():
+    if not supplemental and (repo / "audible-calendar.sealed").exists():
         initialize_audible_receipts(repo)
         return
     key = os.environ.get("BULKPUBLISH_API_KEY", "")
     worker.require(key.startswith("bp_"), "media_stage_api_key_missing")
-    encrypted_bundle = repo / "audible-media-stage.sealed"
+    encrypted_bundle = supplemental_bundle if supplemental else repo / "audible-media-stage.sealed"
+    bundle_hash = AUDIBLE_MEDIA_SUPPLEMENT_SHA if supplemental else AUDIBLE_MEDIA_BUNDLE_SHA
     worker.require(encrypted_bundle.stat().st_size <= audible_envelope.MAX_BUNDLE_BYTES + audible_envelope.OVERHEAD,
                    "media_stage_envelope_size")
     private = audible_envelope.open_in_runner(encrypted_bundle.read_bytes(), receiver)
-    worker.require(sha256(private).hexdigest() == AUDIBLE_MEDIA_BUNDLE_SHA, "media_stage_unapproved_bundle")
-    state_file = repo / "audible-media-stage-state.sealed"
+    worker.require(sha256(private).hexdigest() == bundle_hash, "media_stage_unapproved_bundle")
+    original_state_file = repo / "audible-media-stage-state.sealed"
+    state_file = repo / "audible-media-supplement-state.sealed" if supplemental else original_state_file
+    state_aad = AUDIBLE_MEDIA_STAGE_AAD + b":supplement" if supplemental else AUDIBLE_MEDIA_STAGE_AAD
     prior = None
     if state_file.exists():
         worker.require(state_file.stat().st_size <= 16 * 1024, "media_stage_checkpoint_size")
-        prior = json.loads(decrypt(state_file.read_bytes(), AUDIBLE_MEDIA_STAGE_AAD))
+        prior = json.loads(decrypt(state_file.read_bytes(), state_aad))
 
     def checkpoint(state):
         plain = json.dumps(state, separators=(",", ":")).encode()
         worker.require(len(plain) <= 16 * 1024 - 28, "media_stage_checkpoint_size")
         tmp = state_file.with_suffix(".tmp")
-        tmp.write_bytes(encrypt(plain, AUDIBLE_MEDIA_STAGE_AAD))
+        tmp.write_bytes(encrypt(plain, state_aad))
         tmp.replace(state_file)
         for args in (["add", "--", state_file.name], ["commit", "-m", "Persist encrypted media upload checkpoint"],
                      ["push", "origin", "HEAD:" + AUDIBLE_MEDIA_STAGE_REF]):
@@ -323,7 +329,8 @@ def run_audible_media_stage(repo, execute, mode, now):
         with zipfile.ZipFile(io.BytesIO(private)) as bundle:
             entries = bundle.infolist()
             names = {item.filename for item in entries}
-            worker.require(len(entries) == len(names) == 9
+            worker.require(len(entries) == len(names)
+                           and (2 <= len(names) <= 9 if supplemental else len(names) == 9)
                            and sum(item.file_size for item in entries) <= audible_envelope.MAX_BUNDLE_BYTES
                            and bundle.getinfo("manifest.json").file_size <= 16 * 1024,
                            "media_stage_archive_shape")
@@ -334,6 +341,28 @@ def run_audible_media_stage(repo, execute, mode, now):
                            "media_stage_archive_entries")
             for name in files:
                 (media_root / name).write_bytes(bundle.read(name))
+        if supplemental:
+            worker.require(original_state_file.stat().st_size <= 16 * 1024, "media_stage_checkpoint_size")
+            original = json.loads(decrypt(original_state_file.read_bytes(), AUDIBLE_MEDIA_STAGE_AAD))["items"]
+            original_hashes = {item["sha256"] for item in original.values()}
+            worker.require(len(original) == 8 and all(item["phase"] == "uploaded_verified" for item in original.values())
+                           and all(item["event_id"] not in original and item["sha256"] not in original_hashes
+                                   for item in manifest["items"]), "media_stage_supplement_inventory")
+        if mode == "verify":
+            plan, manifest_hash = audible_media_stage.prepare(media_root, manifest)
+            entries = audible_media_stage.previous(prior, manifest_hash, plan)["items"]
+            worker.require(set(entries) == set(plan), "media_stage_supplement_readback_incomplete")
+            api = AudibleCalendarTransport(key)
+            for event, (path, _, size) in plan.items():
+                media_id = entries[event]["media_id"]
+                response = api.call("GET", f"/api/media/{media_id}")
+                media = worker.response_candidate(response, "media")
+                worker.require(media["id"] == media_id and media["fileName"] == path.name
+                               and media["mimeType"] == "video/mp4" and media["sizeBytes"] == size,
+                               "media_stage_supplement_readback_mismatch")
+            print(json.dumps({"status": "audible_media_supplement_verified", "count": len(entries),
+                              "requests": api.count}))
+            return
         api = AudibleMediaTransport(key)
         result = audible_media_stage.stage(media_root, config, manifest, api, checkpoint, prior)
         print(json.dumps({"status": result["status"], "count": result["count"], "requests": api.count}))
