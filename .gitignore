@@ -5,6 +5,9 @@
 !/worker.py
 !/sealed_runner.py
 !/audible_envelope.py
+!/audible_media_stage.py
+!/audible-media-stage.sealed
+!/audible-media-stage-state.sealed
 !/qstash_cleanup.py
 !/requirements.txt
 !/bundle.sealed

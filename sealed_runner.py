@@ -2,6 +2,7 @@
 import argparse
 import base64
 import datetime as dt
+from hashlib import sha256
 import io
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import zipfile
+import re
 import worker
 
 BUNDLE_AAD = b"approved-snap-cloud-bundle-v1"
@@ -16,6 +18,8 @@ STATE_AAD = b"approved-snap-cloud-state-v1"
 MAX_BUNDLE_BYTES = 64 * 1024 * 1024
 MAX_STATE_BYTES = 1024 * 1024
 AUDIBLE_MEDIA_STAGE_REF = "refs/heads/codex/snap-audible-media-stage"
+AUDIBLE_MEDIA_STAGE_AAD = b"approved-snap-audible-media-stage-state-v1"
+AUDIBLE_MEDIA_BUNDLE_SHA = "2d3164511fd9d367239e3c205835e540a66bce62f33aa002c9434f4aaec38586"
 
 
 def cipher():
@@ -192,17 +196,92 @@ def delivery_check(root, config, api, now, checkpoint):
         raise worker.Halt("delivery_result_unknown_no_retry")
 
 
+class AudibleMediaTransport(worker.Transport):
+    request_limit = 11
+
+    def call(self, method, path, body=None, content_type="application/json"):
+        valid_read = method == "GET" and body is None and path in (
+            "/api/api-keys/usage", "/api/quotas/usage", "/api/channels")
+        valid_upload = method == "POST" and body is not None and path == "/api/media"
+        worker.require(valid_read or valid_upload, "media_stage_transport_scope")
+        return super().call(method, path, body, content_type)
+
+
+def run_audible_media_stage(repo, execute, mode, now):
+    import audible_envelope
+    import audible_media_stage
+
+    local = now.astimezone(worker.RIYADH)
+    worker.require(os.environ.get("GITHUB_REPOSITORY") == "taqdeersa/approved-content-queue-2026-11"
+                   and local.date() == dt.date(2026, 11, 10)
+                   and os.environ.get("QUEUE_ZERO_COST_VERIFIED") == "true"
+                   and (mode, execute) in (("verify", False), ("publish", True)), "media_stage_scope")
+    receiver = audible_envelope.runner_receiver(os.environ["SNAP_QUEUE_SEAL_KEY"])
+    if mode == "verify":
+        print("AUDIBLE_RECEIVER_PUBLIC_V1=" + base64.b64encode(audible_envelope.public_bytes(receiver)).decode("ascii"))
+        return
+    worker.require(not dt.time(10, 10) <= local.time() <= dt.time(10, 25), "media_stage_silent_window_reserved")
+    key = os.environ.get("BULKPUBLISH_API_KEY", "")
+    worker.require(key.startswith("bp_"), "media_stage_api_key_missing")
+    encrypted_bundle = repo / "audible-media-stage.sealed"
+    worker.require(encrypted_bundle.stat().st_size <= audible_envelope.MAX_BUNDLE_BYTES + audible_envelope.OVERHEAD,
+                   "media_stage_envelope_size")
+    private = audible_envelope.open_in_runner(encrypted_bundle.read_bytes(), receiver)
+    worker.require(sha256(private).hexdigest() == AUDIBLE_MEDIA_BUNDLE_SHA, "media_stage_unapproved_bundle")
+    state_file = repo / "audible-media-stage-state.sealed"
+    prior = None
+    if state_file.exists():
+        worker.require(state_file.stat().st_size <= 16 * 1024, "media_stage_checkpoint_size")
+        prior = json.loads(decrypt(state_file.read_bytes(), AUDIBLE_MEDIA_STAGE_AAD))
+
+    def checkpoint(state):
+        plain = json.dumps(state, separators=(",", ":")).encode()
+        worker.require(len(plain) <= 16 * 1024 - 28, "media_stage_checkpoint_size")
+        tmp = state_file.with_suffix(".tmp")
+        tmp.write_bytes(encrypt(plain, AUDIBLE_MEDIA_STAGE_AAD))
+        tmp.replace(state_file)
+        for args in (["add", "--", state_file.name], ["commit", "-m", "Persist encrypted media upload checkpoint"],
+                     ["push", "origin", "HEAD:" + AUDIBLE_MEDIA_STAGE_REF]):
+            result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=25)
+            worker.require(result.returncode == 0, "media_stage_checkpoint_not_persisted")
+        return True
+
+    with tempfile.TemporaryDirectory(prefix="audible-media-stage-") as folder:
+        root = Path(folder)
+        frozen = root / "frozen"
+        frozen.mkdir()
+        extract_bundle(decrypt((repo / "bundle.sealed").read_bytes(), BUNDLE_AAD), frozen)
+        config = worker.read(frozen / "config.json")
+        approved = worker.read(frozen / "manifest.json")
+        worker.require(approved["account"] == config["verified_username"]
+                       and approved["audience"] == "My Story Public" and config.get("identity_evidence_reference")
+                       and worker.sha(frozen / "manifest.json") == config.get("manifest_sha256"),
+                       "media_stage_destination_unverified")
+        media_root = root / "media"
+        media_root.mkdir()
+        with zipfile.ZipFile(io.BytesIO(private)) as bundle:
+            entries = bundle.infolist()
+            names = {item.filename for item in entries}
+            worker.require(len(entries) == len(names) == 9
+                           and sum(item.file_size for item in entries) <= audible_envelope.MAX_BUNDLE_BYTES
+                           and bundle.getinfo("manifest.json").file_size <= 16 * 1024,
+                           "media_stage_archive_shape")
+            manifest = json.loads(bundle.read("manifest.json"))
+            files = {item["file"] for item in manifest["items"]}
+            worker.require(names == files | {"manifest.json"}
+                           and all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}\.mp4", name) for name in files),
+                           "media_stage_archive_entries")
+            for name in files:
+                (media_root / name).write_bytes(bundle.read(name))
+        api = AudibleMediaTransport(key)
+        result = audible_media_stage.stage(media_root, config, manifest, api, checkpoint, prior)
+        print(json.dumps({"status": result["status"], "count": result["count"], "requests": api.count}))
+
+
 def run(repo, execute=False, mode="verify", now=None):
     now = now or dt.datetime.now(worker.RIYADH)
     if os.environ.get("GITHUB_REF") == AUDIBLE_MEDIA_STAGE_REF:
-        import audible_envelope
-
-        worker.require(os.environ.get("GITHUB_REPOSITORY") == "taqdeersa/approved-content-queue-2026-11"
-                       and now.astimezone(worker.RIYADH).date() == dt.date(2026, 11, 10)
-                       and os.environ.get("QUEUE_ZERO_COST_VERIFIED") == "true"
-                       and mode == "verify" and not execute, "audible_media_key_probe_scope")
-        receiver = audible_envelope.runner_receiver(os.environ["SNAP_QUEUE_SEAL_KEY"])
-        print("AUDIBLE_RECEIVER_PUBLIC_V1=" + base64.b64encode(audible_envelope.public_bytes(receiver)).decode("ascii"))
+        run_audible_media_stage(repo, execute, mode, now)
         return
     worker.require(mode in ("verify", "publish", "delivery") and not (mode != "publish" and execute), "read_only_mode_cannot_execute")
     needs_api = mode in ("verify", "delivery") or execute
@@ -257,6 +336,11 @@ if __name__ == "__main__":
             seal(a.root.resolve(), a.target.resolve())
         else:
             run(a.root.resolve(), a.execute, a.mode)
-    except Exception:
+    except Exception as error:
+        if os.environ.get("GITHUB_REF") == AUDIBLE_MEDIA_STAGE_REF:
+            reason = str(error) if isinstance(error, worker.Halt) else "media_stage_unexpected_result"
+            if not re.fullmatch(r"(?:media_stage_|http_or_json_result_unknown_)[a-zA-Z0-9_]{1,75}", reason):
+                reason = "media_stage_runtime_gate"
+            print(json.dumps({"status": "audible_media_stage_halted", "reason": reason}))
         print('{"status":"halt","reason":"sealed_runner_gate_or_result_unknown"}')
         raise SystemExit(2)

@@ -89,12 +89,14 @@ def compile_plan(source, root, expected_account):
 
 
 class Transport:
+    request_limit = 8
+
     def __init__(self, key):
         self.key, self.count = key, 0
 
     def call(self, method, path, body=None, content_type="application/json"):
         self.count += 1
-        require(self.count <= 8, "request_limit")
+        require(self.count <= self.request_limit, "request_limit")
         headers = {"Authorization": "Bearer " + self.key, "Accept": "application/json"}
         if body is not None:
             headers["Content-Type"] = content_type
