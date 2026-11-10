@@ -31,7 +31,8 @@ def prepare(root, manifest):
     for item in items:
         worker.require(isinstance(item, dict), "media_stage_invalid_item")
         event, name, digest, size = (item.get(key) for key in ("event_id", "file", "sha256", "bytes"))
-        worker.require(isinstance(event, str) and re.fullmatch(r"2026-11-(?:1[0-9]|2[0-9]|30):main", event)
+        worker.require(isinstance(event, str)
+                       and (re.fullmatch(r"2026-11-(?:1[0-9]|2[0-9]|30):main", event) or event == "2026-11-10:trend")
                        and event not in plan and isinstance(name, str)
                        and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}\.mp4", name)
                        and name.casefold() not in names and isinstance(digest, str)

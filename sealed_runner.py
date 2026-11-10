@@ -21,6 +21,7 @@ AUDIBLE_MEDIA_STAGE_REF = "refs/heads/codex/snap-audible-media-stage"
 AUDIBLE_MEDIA_STAGE_AAD = b"approved-snap-audible-media-stage-state-v1"
 AUDIBLE_MEDIA_BUNDLE_SHA = "2d3164511fd9d367239e3c205835e540a66bce62f33aa002c9434f4aaec38586"
 AUDIBLE_MEDIA_SUPPLEMENT_SHA = "a7e60def911f5778b230164b6094e64131efd35b6ea5870ff503fd56b75b262c"
+AUDIBLE_MEDIA_TREND_SHA = "67d082245214ae1796bb917cf0b21735c4aa2161162b46c96f5221b402d6e38b"
 AUDIBLE_CALENDAR_SHA = "1f3eb703fec69b09d45bc74680e769fe4903221c4e0e95fbf81287ad668ee66e"
 AUDIBLE_RECEIPTS_AAD = b"approved-snap-audible-receipts-v1"
 
@@ -271,6 +272,14 @@ def initialize_audible_receipts(repo):
     print('{"status":"audible_empty_receipts_initialized","count":0,"requests":0}')
 
 
+def verified_audible_entries(path, aad, count):
+    worker.require(path.stat().st_size <= 16 * 1024, "media_stage_checkpoint_size")
+    entries = json.loads(decrypt(path.read_bytes(), aad))["items"]
+    worker.require(len(entries) == count and all(item["phase"] == "uploaded_verified" for item in entries.values()),
+                   "media_stage_supplement_inventory")
+    return entries
+
+
 def run_audible_media_stage(repo, execute, mode, now):
     import audible_envelope
     import audible_media_stage
@@ -285,8 +294,10 @@ def run_audible_media_stage(repo, execute, mode, now):
         print("AUDIBLE_RECEIVER_PUBLIC_V1=" + base64.b64encode(audible_envelope.public_bytes(receiver)).decode("ascii"))
         return
     worker.require(not dt.time(10, 10) <= local.time() <= dt.time(10, 25), "media_stage_silent_window_reserved")
+    trend_bundle = repo / "audible-media-trend.sealed"
     supplemental_bundle = repo / "audible-media-supplement.sealed"
-    supplemental = supplemental_bundle.exists()
+    trend = trend_bundle.exists()
+    supplemental = trend or supplemental_bundle.exists()
     if mode == "verify" and not supplemental:
         verify_audible_calendar(repo, receiver, now)
         return
@@ -297,13 +308,19 @@ def run_audible_media_stage(repo, execute, mode, now):
     worker.require(key.startswith("bp_"), "media_stage_api_key_missing")
     encrypted_bundle = supplemental_bundle if supplemental else repo / "audible-media-stage.sealed"
     bundle_hash = AUDIBLE_MEDIA_SUPPLEMENT_SHA if supplemental else AUDIBLE_MEDIA_BUNDLE_SHA
+    original_state_file = repo / "audible-media-stage-state.sealed"
+    supplement_state_file = repo / "audible-media-supplement-state.sealed"
+    supplement_aad = AUDIBLE_MEDIA_STAGE_AAD + b":supplement"
+    state_file = supplement_state_file if supplemental else original_state_file
+    state_aad = supplement_aad if supplemental else AUDIBLE_MEDIA_STAGE_AAD
+    if trend:
+        encrypted_bundle, bundle_hash = trend_bundle, AUDIBLE_MEDIA_TREND_SHA
+        state_file = repo / "audible-media-trend-state.sealed"
+        state_aad = AUDIBLE_MEDIA_STAGE_AAD + b":trend"
     worker.require(encrypted_bundle.stat().st_size <= audible_envelope.MAX_BUNDLE_BYTES + audible_envelope.OVERHEAD,
                    "media_stage_envelope_size")
     private = audible_envelope.open_in_runner(encrypted_bundle.read_bytes(), receiver)
     worker.require(sha256(private).hexdigest() == bundle_hash, "media_stage_unapproved_bundle")
-    original_state_file = repo / "audible-media-stage-state.sealed"
-    state_file = repo / "audible-media-supplement-state.sealed" if supplemental else original_state_file
-    state_aad = AUDIBLE_MEDIA_STAGE_AAD + b":supplement" if supplemental else AUDIBLE_MEDIA_STAGE_AAD
     prior = None
     if state_file.exists():
         worker.require(state_file.stat().st_size <= 16 * 1024, "media_stage_checkpoint_size")
@@ -342,12 +359,15 @@ def run_audible_media_stage(repo, execute, mode, now):
             for name in files:
                 (media_root / name).write_bytes(bundle.read(name))
         if supplemental:
-            worker.require(original_state_file.stat().st_size <= 16 * 1024, "media_stage_checkpoint_size")
-            original = json.loads(decrypt(original_state_file.read_bytes(), AUDIBLE_MEDIA_STAGE_AAD))["items"]
+            original = verified_audible_entries(original_state_file, AUDIBLE_MEDIA_STAGE_AAD, 8)
+            if trend:
+                original |= verified_audible_entries(supplement_state_file, supplement_aad, 7)
+                worker.require(len(original) == 15 and len(manifest["items"]) == 1
+                               and manifest["items"][0]["event_id"] == "2026-11-10:trend",
+                               "media_stage_supplement_inventory")
             original_hashes = {item["sha256"] for item in original.values()}
-            worker.require(len(original) == 8 and all(item["phase"] == "uploaded_verified" for item in original.values())
-                           and all(item["event_id"] not in original and item["sha256"] not in original_hashes
-                                   for item in manifest["items"]), "media_stage_supplement_inventory")
+            worker.require(all(item["event_id"] not in original and item["sha256"] not in original_hashes
+                               for item in manifest["items"]), "media_stage_supplement_inventory")
         if mode == "verify":
             plan, manifest_hash = audible_media_stage.prepare(media_root, manifest)
             entries = audible_media_stage.previous(prior, manifest_hash, plan)["items"]

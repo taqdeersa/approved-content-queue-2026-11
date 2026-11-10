@@ -11,6 +11,8 @@
 !/audible-media-stage-state.sealed
 !/audible-media-supplement.sealed
 !/audible-media-supplement-state.sealed
+!/audible-media-trend.sealed
+!/audible-media-trend-state.sealed
 !/audible-receipts.sealed
 !/audible-calendar.sealed
 !/qstash_cleanup.py
