@@ -21,6 +21,7 @@ AUDIBLE_MEDIA_STAGE_REF = "refs/heads/codex/snap-audible-media-stage"
 AUDIBLE_MEDIA_STAGE_AAD = b"approved-snap-audible-media-stage-state-v1"
 AUDIBLE_MEDIA_BUNDLE_SHA = "2d3164511fd9d367239e3c205835e540a66bce62f33aa002c9434f4aaec38586"
 AUDIBLE_CALENDAR_SHA = "1f3eb703fec69b09d45bc74680e769fe4903221c4e0e95fbf81287ad668ee66e"
+AUDIBLE_RECEIPTS_AAD = b"approved-snap-audible-receipts-v1"
 
 
 def cipher():
@@ -251,6 +252,24 @@ def verify_audible_calendar(repo, receiver, now):
     print(json.dumps(result))
 
 
+def initialize_audible_receipts(repo):
+    state_file = repo / "audible-media-stage-state.sealed"
+    worker.require(state_file.stat().st_size <= 16 * 1024, "media_stage_checkpoint_size")
+    entries = json.loads(decrypt(state_file.read_bytes(), AUDIBLE_MEDIA_STAGE_AAD))["items"]
+    worker.require(len(entries) == 8 and all(item["phase"] == "uploaded_verified" for item in entries.values()),
+                   "media_stage_receipt_inventory_unverified")
+    receipts = repo / "audible-receipts.sealed"
+    # This branch has only uploaded media. An empty authenticated ledger
+    # proves the reader can reach this branch before any audible Story exists.
+    with receipts.open("xb") as destination:
+        destination.write(encrypt(b"[]", AUDIBLE_RECEIPTS_AAD))
+    for args in (["add", "--", receipts.name], ["commit", "-m", "Initialize encrypted audible Story receipts"],
+                 ["push", "origin", "HEAD:" + AUDIBLE_MEDIA_STAGE_REF]):
+        result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=25)
+        worker.require(result.returncode == 0, "media_stage_receipt_checkpoint_not_persisted")
+    print('{"status":"audible_empty_receipts_initialized","count":0,"requests":0}')
+
+
 def run_audible_media_stage(repo, execute, mode, now):
     import audible_envelope
     import audible_media_stage
@@ -267,6 +286,9 @@ def run_audible_media_stage(repo, execute, mode, now):
     worker.require(not dt.time(10, 10) <= local.time() <= dt.time(10, 25), "media_stage_silent_window_reserved")
     if mode == "verify":
         verify_audible_calendar(repo, receiver, now)
+        return
+    if (repo / "audible-calendar.sealed").exists():
+        initialize_audible_receipts(repo)
         return
     key = os.environ.get("BULKPUBLISH_API_KEY", "")
     worker.require(key.startswith("bp_"), "media_stage_api_key_missing")
