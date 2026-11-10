@@ -20,6 +20,7 @@ MAX_STATE_BYTES = 1024 * 1024
 AUDIBLE_MEDIA_STAGE_REF = "refs/heads/codex/snap-audible-media-stage"
 AUDIBLE_MEDIA_STAGE_AAD = b"approved-snap-audible-media-stage-state-v1"
 AUDIBLE_MEDIA_BUNDLE_SHA = "2d3164511fd9d367239e3c205835e540a66bce62f33aa002c9434f4aaec38586"
+AUDIBLE_CALENDAR_SHA = "1f3eb703fec69b09d45bc74680e769fe4903221c4e0e95fbf81287ad668ee66e"
 
 
 def cipher():
@@ -207,6 +208,49 @@ class AudibleMediaTransport(worker.Transport):
         return super().call(method, path, body, content_type)
 
 
+class AudibleCalendarTransport(worker.Transport):
+    request_limit = 12
+
+    def call(self, method, path, body=None, content_type="application/json"):
+        allowed = path in ("/api/api-keys/usage", "/api/quotas/usage?tz=Asia%2FRiyadh",
+                           "/api/posts?scheduledFrom=2026-11-10&scheduledTo=2026-11-30&limit=500")
+        worker.require(method == "GET" and body is None
+                       and (allowed or re.fullmatch(r"/api/(?:media/[1-9][0-9]*|posts\?channelId=[1-9][0-9]*&limit=500)", path)),
+                       "media_stage_calendar_read_only")
+        return super().call(method, path, body, content_type)
+
+
+def read_frozen_stage_config(repo, root):
+    root.mkdir()
+    extract_bundle(decrypt((repo / "bundle.sealed").read_bytes(), BUNDLE_AAD), root)
+    config = worker.read(root / "config.json")
+    approved = worker.read(root / "manifest.json")
+    worker.require(approved["account"] == config["verified_username"]
+                   and approved["audience"] == "My Story Public" and config.get("identity_evidence_reference")
+                   and worker.sha(root / "manifest.json") == config.get("manifest_sha256"),
+                   "media_stage_destination_unverified")
+    return config
+
+
+def verify_audible_calendar(repo, receiver, now):
+    import audible_envelope
+    import audible_schedule_preflight
+
+    calendar_file = repo / "audible-calendar.sealed"
+    state_file = repo / "audible-media-stage-state.sealed"
+    worker.require(calendar_file.stat().st_size < 16 * 1024 and state_file.stat().st_size <= 16 * 1024,
+                   "media_stage_calendar_bundle_size")
+    private = audible_envelope.open_in_runner(calendar_file.read_bytes(), receiver)
+    worker.require(sha256(private).hexdigest() == AUDIBLE_CALENDAR_SHA, "media_stage_calendar_unapproved")
+    state = json.loads(decrypt(state_file.read_bytes(), AUDIBLE_MEDIA_STAGE_AAD))
+    key = os.environ.get("BULKPUBLISH_API_KEY", "")
+    worker.require(key.startswith("bp_"), "media_stage_api_key_missing")
+    with tempfile.TemporaryDirectory(prefix="audible-calendar-read-") as folder:
+        config = read_frozen_stage_config(repo, Path(folder) / "frozen")
+        result = audible_schedule_preflight.check(json.loads(private), state, config, AudibleCalendarTransport(key), now)
+    print(json.dumps(result))
+
+
 def run_audible_media_stage(repo, execute, mode, now):
     import audible_envelope
     import audible_media_stage
@@ -217,10 +261,13 @@ def run_audible_media_stage(repo, execute, mode, now):
                    and os.environ.get("QUEUE_ZERO_COST_VERIFIED") == "true"
                    and (mode, execute) in (("verify", False), ("publish", True)), "media_stage_scope")
     receiver = audible_envelope.runner_receiver(os.environ["SNAP_QUEUE_SEAL_KEY"])
-    if mode == "verify":
+    if mode == "verify" and not (repo / "audible-calendar.sealed").exists():
         print("AUDIBLE_RECEIVER_PUBLIC_V1=" + base64.b64encode(audible_envelope.public_bytes(receiver)).decode("ascii"))
         return
     worker.require(not dt.time(10, 10) <= local.time() <= dt.time(10, 25), "media_stage_silent_window_reserved")
+    if mode == "verify":
+        verify_audible_calendar(repo, receiver, now)
+        return
     key = os.environ.get("BULKPUBLISH_API_KEY", "")
     worker.require(key.startswith("bp_"), "media_stage_api_key_missing")
     encrypted_bundle = repo / "audible-media-stage.sealed"
@@ -248,15 +295,7 @@ def run_audible_media_stage(repo, execute, mode, now):
 
     with tempfile.TemporaryDirectory(prefix="audible-media-stage-") as folder:
         root = Path(folder)
-        frozen = root / "frozen"
-        frozen.mkdir()
-        extract_bundle(decrypt((repo / "bundle.sealed").read_bytes(), BUNDLE_AAD), frozen)
-        config = worker.read(frozen / "config.json")
-        approved = worker.read(frozen / "manifest.json")
-        worker.require(approved["account"] == config["verified_username"]
-                       and approved["audience"] == "My Story Public" and config.get("identity_evidence_reference")
-                       and worker.sha(frozen / "manifest.json") == config.get("manifest_sha256"),
-                       "media_stage_destination_unverified")
+        config = read_frozen_stage_config(repo, root / "frozen")
         media_root = root / "media"
         media_root.mkdir()
         with zipfile.ZipFile(io.BytesIO(private)) as bundle:
